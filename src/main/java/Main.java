@@ -1,3 +1,8 @@
+import com.intellij.util.indexing.ValueContainer;
+import com.intellij.util.indexing.impl.UpdatableValueContainer;
+import com.intellij.util.indexing.impl.ValueContainerExternalizer;
+import com.intellij.util.indexing.impl.ValueContainerImpl;
+import com.intellij.util.indexing.impl.ValueContainerInputRemapping;
 import com.intellij.util.io.DataExternalizer;
 import com.intellij.util.io.InlineKeyDescriptor;
 import com.intellij.util.io.KeyDescriptor;
@@ -14,11 +19,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.TreeMap;
 
 /**
  * Mimics the real {@code com.intellij.psi.impl.cache.impl.id.IdIndex}: keys are word-hash-derived
- * {@link IdIndexEntry}s stored via {@link InlineKeyDescriptor}, values are single-byte occurrence
- * bitmasks mirroring {@code com.intellij.psi.search.UsageSearchContext} (not a real dependency here).
+ * {@link IdIndexEntry}s stored via {@link InlineKeyDescriptor}. Values are the same "postings"
+ * shape the real {@code MapIndexStorage} uses -- a {@link ValueContainerImpl} mapping each
+ * distinct occurrence bitmask (mirroring {@code com.intellij.psi.search.UsageSearchContext}, not
+ * a real dependency here) to the (fake) file IDs that produced it.
  */
 public class Main {
   private static final int IN_CODE = 0x1;
@@ -39,7 +47,7 @@ public class Main {
     }
   };
 
-  private static final DataExternalizer<Integer> VALUE_EXTERNALIZER = new DataExternalizer<>() {
+  private static final DataExternalizer<Integer> MASK_EXTERNALIZER = new DataExternalizer<>() {
     @Override
     public void save(DataOutput out, Integer value) throws IOException {
       out.write(value & 0xFF);
@@ -51,21 +59,26 @@ public class Main {
     }
   };
 
+  // Same wrapping MapIndexStorage.createValueContainerMap() does: the persistent map's real value
+  // type is a postings list (value -> fileIds), not a bare Integer.
+  private static final DataExternalizer<UpdatableValueContainer<Integer>> VALUE_EXTERNALIZER =
+      new ValueContainerExternalizer<>(MASK_EXTERNALIZER, ValueContainerInputRemapping.IDENTITY);
+
   public static void main(String[] args) throws Exception {
     int entryCount = parseEntryCount(args);
 
-    Map<IdIndexEntry, Integer> data = generateSyntheticIndex(entryCount);
+    Map<IdIndexEntry, Map<Integer, Integer>> data = generateSyntheticIndex(entryCount);
 
     Path file = Files.createTempFile("id-index-demo", "");
     Files.deleteIfExists(file);
 
     // 1. populate and flush/close
-    PersistentMapImpl<IdIndexEntry, Integer> map =
+    PersistentMapImpl<IdIndexEntry, UpdatableValueContainer<Integer>> map =
         new PersistentMapImpl<>(PersistentMapBuilder.newBuilder(file, KEY_DESCRIPTOR, VALUE_EXTERNALIZER));
     long writeStart = System.nanoTime();
     try {
-      for (Map.Entry<IdIndexEntry, Integer> entry : data.entrySet()) {
-        map.put(entry.getKey(), entry.getValue());
+      for (Map.Entry<IdIndexEntry, Map<Integer, Integer>> entry : data.entrySet()) {
+        map.put(entry.getKey(), toValueContainer(entry.getValue()));
       }
       map.force();
     } finally {
@@ -76,13 +89,13 @@ public class Main {
         entryCount, writeMillis, ratePerSec(entryCount, writeMillis));
 
     // 2. reopen from the SAME file path -- proves the round-trip through disk
-    PersistentMapImpl<IdIndexEntry, Integer> reopened =
+    PersistentMapImpl<IdIndexEntry, UpdatableValueContainer<Integer>> reopened =
         new PersistentMapImpl<>(PersistentMapBuilder.newBuilder(file, KEY_DESCRIPTOR, VALUE_EXTERNALIZER));
     int mismatches = 0;
     long readStart = System.nanoTime();
     try {
-      for (Map.Entry<IdIndexEntry, Integer> entry : data.entrySet()) {
-        Integer actual = reopened.get(entry.getKey());
+      for (Map.Entry<IdIndexEntry, Map<Integer, Integer>> entry : data.entrySet()) {
+        Map<Integer, Integer> actual = toFileIdToMaskMap(reopened.get(entry.getKey()));
         if (!entry.getValue().equals(actual)) {
           mismatches++;
         }
@@ -102,9 +115,9 @@ public class Main {
 
     System.out.println("Sample entries:");
     int shown = 0;
-    for (Map.Entry<IdIndexEntry, Integer> entry : data.entrySet()) {
+    for (Map.Entry<IdIndexEntry, Map<Integer, Integer>> entry : data.entrySet()) {
       if (shown++ >= 5) break;
-      System.out.println("  " + entry.getKey() + " -> " + describeMask(entry.getValue()));
+      System.out.println("  " + entry.getKey() + " -> " + describePostings(entry.getValue()));
     }
   }
 
@@ -128,18 +141,34 @@ public class Main {
 
   /**
    * Derives keys from synthetic word hashes (like the real indexer does), retrying on collision
-   * so the map ends up with exactly {@code entryCount} distinct entries, and assigns each a
-   * realistic occurrence mask (mostly IN_CODE, occasionally combined with other contexts).
+   * so the map ends up with exactly {@code entryCount} distinct entries. Each entry's value is a
+   * handful of FAKE file IDs (not real files -- just plausible-looking positive ints) mapped to a
+   * realistic occurrence mask, mimicking the (value -> fileIds) postings shape of a real index.
    */
-  private static Map<IdIndexEntry, Integer> generateSyntheticIndex(int entryCount) {
+  private static Map<IdIndexEntry, Map<Integer, Integer>> generateSyntheticIndex(int entryCount) {
     Random random = new Random(42);
-    Map<IdIndexEntry, Integer> data = new LinkedHashMap<>(entryCount);
+    int fakeFileCount = entryCount / 100;
+    Map<IdIndexEntry, Map<Integer, Integer>> data = new LinkedHashMap<>(entryCount);
     while (data.size() < entryCount) {
       String word = randomWord(random);
       IdIndexEntry key = new IdIndexEntry(word.hashCode());
-      data.putIfAbsent(key, randomOccurrenceMask(random));
+      if (data.containsKey(key)) {
+        continue;
+      }
+      data.put(key, randomPostings(random, fakeFileCount));
     }
     return data;
+  }
+
+  /** fileId -> occurrence mask, for a handful of fake files "containing" this word. */
+  private static Map<Integer, Integer> randomPostings(Random random, int fakeFileCount) {
+    int postingsCount = 1 + random.nextInt(4);
+    Map<Integer, Integer> postings = new TreeMap<>();
+    while (postings.size() < postingsCount) {
+      int fakeFileId = 1 + random.nextInt(fakeFileCount); // file IDs must be > 0
+      postings.put(fakeFileId, randomOccurrenceMask(random));
+    }
+    return postings;
   }
 
   private static String randomWord(Random random) {
@@ -159,6 +188,33 @@ public class Main {
     if (random.nextInt(50) == 0) mask |= IN_FOREIGN_LANGUAGES;
     if (random.nextInt(20) == 0) mask |= IN_PLAIN_TEXT;
     return mask;
+  }
+
+  private static UpdatableValueContainer<Integer> toValueContainer(Map<Integer, Integer> postings) {
+    ValueContainerImpl<Integer> container = ValueContainerImpl.createNewValueContainer();
+    for (Map.Entry<Integer, Integer> posting : postings.entrySet()) {
+      container.addValue(posting.getKey(), posting.getValue());
+    }
+    return container;
+  }
+
+  private static Map<Integer, Integer> toFileIdToMaskMap(ValueContainer<Integer> container) {
+    Map<Integer, Integer> result = new TreeMap<>();
+    if (container != null) {
+      container.forEach((fileId, mask) -> {
+        result.put(fileId, mask);
+        return true;
+      });
+    }
+    return result;
+  }
+
+  private static String describePostings(Map<Integer, Integer> postings) {
+    List<String> parts = new ArrayList<>();
+    for (Map.Entry<Integer, Integer> posting : postings.entrySet()) {
+      parts.add("file#" + posting.getKey() + "=" + describeMask(posting.getValue()));
+    }
+    return String.join(", ", parts);
   }
 
   private static String describeMask(int mask) {

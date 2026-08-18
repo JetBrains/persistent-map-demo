@@ -19,4 +19,12 @@ java {
 
 application {
     mainClass.set("Main")
+    // com.intellij.util.io.ByteBufferUtil reflectively accesses sun.nio.ch.DirectBuffer and
+    // jdk.internal.ref.Cleaner to explicitly unmap direct buffers when the page cache evicts
+    // pages under memory pressure -- needs both opened, unlike the real IDE which bakes these
+    // into its own .vmoptions file.
+    applicationDefaultJvmArgs = listOf(
+        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+        "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
+    )
 }

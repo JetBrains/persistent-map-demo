@@ -65,12 +65,19 @@ public class Main {
       new ValueContainerExternalizer<>(MASK_EXTERNALIZER, ValueContainerInputRemapping.IDENTITY);
 
   public static void main(String[] args) throws Exception {
+    if (args.length < 2) {
+      System.err.println("Usage: gradle run --args=\"<entryCount> <directory>\" -- both arguments are required.");
+      System.exit(1);
+      return;
+    }
     int entryCount = parseEntryCount(args);
+    Path directory = parseDirectory(args);
 
     Map<IdIndexEntry, Map<Integer, Integer>> data = generateSyntheticIndex(entryCount);
 
-    Path file = Files.createTempFile("id-index-demo", "");
+    Path file = Files.createTempFile(directory, "id-index-demo", "");
     Files.deleteIfExists(file);
+    System.out.println("Using base file: " + file.toAbsolutePath());
 
     // 1. populate and flush/close
     PersistentMapImpl<IdIndexEntry, UpdatableValueContainer<Integer>> map =
@@ -101,10 +108,10 @@ public class Main {
         }
       }
     } finally {
-      // closeAndDelete (not close + Files.deleteIfExists) -- a PersistentMapImpl is backed by
-      // several sibling files (.len, .values, .values.at, _i, _i.len, ...), and this is the
-      // library's own way to clean up the whole file family, not just the base file.
-      reopened.closeAndDelete();
+      // A directory was explicitly requested -- most likely to inspect the resulting file family
+      // (.len, .values, .values.at, _i, _i.len, ...) afterward, so leave it on disk (plain close,
+      // not closeAndDelete).
+      reopened.close();
     }
     long readMillis = (System.nanoTime() - readStart) / 1_000_000;
     System.out.printf("Read %d entries in %d ms (%.0f entries/sec)%n",
@@ -123,10 +130,6 @@ public class Main {
 
   private static int parseEntryCount(String[] args) {
     int defaultCount = 5_000_000;
-    if (args.length == 0) {
-      System.out.println("No entry count given, defaulting to " + defaultCount + " (usage: gradle run --args=\"<entryCount>\")");
-      return defaultCount;
-    }
     try {
       int n = Integer.parseInt(args[0]);
       if (n <= 0) {
@@ -137,6 +140,16 @@ public class Main {
       System.out.println("Invalid entry count '" + args[0] + "', defaulting to " + defaultCount);
       return defaultCount;
     }
+  }
+
+  /**
+   * @return the directory to create the map's files in. Its files are kept on disk after the run
+   *     (not deleted) so they can be inspected.
+   */
+  private static Path parseDirectory(String[] args) throws IOException {
+    Path directory = Path.of(args[1]);
+    Files.createDirectories(directory);
+    return directory;
   }
 
   /**

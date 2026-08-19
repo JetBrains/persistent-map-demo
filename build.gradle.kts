@@ -28,3 +28,20 @@ application {
         "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
     )
 }
+
+// A standalone "fat" jar (app classes + all runtime dependencies merged in, with a Main-Class
+// manifest entry) for uploading as a single downloadable artifact, e.g. to a GitHub release --
+// runnable with just `java -jar` and no separate classpath/dependencies to manage.
+// Note: unlike `gradlew run`, this does NOT bake in the --add-opens flags above (there's no
+// manifest equivalent for JVM args) -- pass them on the `java` command line, see README.
+tasks.register<Jar>("fatJar") {
+    group = "distribution"
+    description = "Builds a standalone runnable jar with all dependencies merged in."
+    archiveClassifier.set("standalone")
+    manifest {
+        attributes["Main-Class"] = application.mainClass.get()
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(sourceSets.main.get().output)
+    from(configurations.runtimeClasspath.map { rc -> rc.map { if (it.isDirectory) it else zipTree(it) } })
+}

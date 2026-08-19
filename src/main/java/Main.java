@@ -3,23 +3,14 @@ import com.intellij.util.indexing.impl.UpdatableValueContainer;
 import com.intellij.util.indexing.impl.ValueContainerExternalizer;
 import com.intellij.util.indexing.impl.ValueContainerImpl;
 import com.intellij.util.indexing.impl.ValueContainerInputRemapping;
-import com.intellij.util.io.DataExternalizer;
-import com.intellij.util.io.InlineKeyDescriptor;
-import com.intellij.util.io.KeyDescriptor;
-import com.intellij.util.io.PersistentMapBuilder;
-import com.intellij.util.io.PersistentMapImpl;
+import com.intellij.util.io.*;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.TreeMap;
+import java.util.*;
 
 /**
  * Mimics the real {@code com.intellij.psi.impl.cache.impl.id.IdIndex}: keys are word-hash-derived
@@ -73,6 +64,7 @@ public class Main {
     int entryCount = parseEntryCount(args);
     Path directory = parseDirectory(args);
 
+    System.out.println("Generating " + entryCount + " entries...");
     Map<IdIndexEntry, Map<Integer, Integer>> data = generateSyntheticIndex(entryCount);
 
     Path file = Files.createTempFile(directory, "id-index-demo", "");
@@ -84,8 +76,14 @@ public class Main {
         new PersistentMapImpl<>(PersistentMapBuilder.newBuilder(file, KEY_DESCRIPTOR, VALUE_EXTERNALIZER));
     long writeStart = System.nanoTime();
     try {
+      int written = 0;
+      int reportEvery = Math.max(1, entryCount / 10);
       for (Map.Entry<IdIndexEntry, Map<Integer, Integer>> entry : data.entrySet()) {
         map.put(entry.getKey(), toValueContainer(entry.getValue()));
+        written++;
+        if (written % reportEvery == 0 || written == entryCount) {
+          System.out.printf("Writing entries: %d/%d (%.0f%%)\n", written, entryCount, 100.0 * written / entryCount);
+        }
       }
       map.force();
     } finally {
